@@ -1,4 +1,4 @@
-# Fluxer REXCTL Auto-Watchdog & Command Deck (`CheckFluxer.ps1`)
+# Fluxer REXCTL Auto-Watchdog & Command Deck
 
 > [!WARNING]
 > **Disclaimer:** This project was written with **Google Gemini 4 Hydrogen** and is **100% vibecoded**. Review the script before running it in production environments.
