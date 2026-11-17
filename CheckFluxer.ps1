@@ -2,13 +2,19 @@
 # Save as CheckFluxer.ps1 and run in PowerShell 5.1 or PowerShell 7+
 
 # --- Configuration ---
-$InstanceDir          = ""   # Optional: set to your Fluxer directory for --dir
-$CheckIntervalMinutes = 60   # Auto-check interval in minutes (60 = every hour)
+$ScriptVersion        = "3.2.0"
+$GitHubRepo           = "Nortonical/fluxer-windows-auto-rexctl"
+$CheckScriptUpdates   = $true  # Set to $false to disable GitHub self-update check
+$InstanceDir          = ""     # Optional: set to your Fluxer directory for --dir
+$CheckIntervalMinutes = 60     # Auto-check interval in minutes (60 = every hour)
 $RunDoctorOnStart     = $false
 
 # --- Console Setup ---
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "FLUXER // REXCTL Auto-Watchdog and Command Deck"
+$Host.UI.RawUI.WindowTitle = "FLUXER // REXCTL Auto-Watchdog and Command Deck v$ScriptVersion"
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 # --- Pure-ASCII Unicode Symbol Table ---
 $Sym = @{
@@ -39,9 +45,12 @@ $Sym = @{
     )
 }
 
-$Script:CheckCount   = 0
-$Script:UpgradeCount = 0
-$Script:LastCheckStr = "Never"
+$Script:CheckCount         = 0
+$Script:UpgradeCount       = 0
+$Script:LastCheckStr       = "Never"
+$Script:RemoteVersion      = $null
+$Script:RemoteScriptBody   = $null
+$Script:ScriptUpdateAvail  = $false
 
 $GlobalRexArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($InstanceDir)) {
@@ -59,6 +68,7 @@ function Show-Header {
     Clear-Host
     $topBorder = $Sym.TL + ($Sym.H * 68) + $Sym.TR
     $botBorder = $Sym.BL + ($Sym.H * 68) + $Sym.BR
+    $verBadge  = ("v" + $ScriptVersion + " LIVE TUI").PadRight(14, ' ')
 
     $b1 = Format-BannerLine "#######+##+     ##+   ##+##+  ##+#######+######+ "
     $b2 = Format-BannerLine "##+====@##|     ##|   ##|*##+##+@##+====@##+==##+"
@@ -93,7 +103,7 @@ function Show-Header {
 
     Write-Host ("  " + $Sym.V + "   ") -NoNewline -ForegroundColor DarkCyan
     Write-Host $b5 -NoNewline -ForegroundColor DarkBlue
-    Write-Host "  v3.1 LIVE TUI " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("  " + $verBadge) -NoNewline -ForegroundColor DarkGray
     Write-Host $Sym.V -ForegroundColor DarkCyan
 
     Write-Host ("  " + $Sym.V + "   ") -NoNewline -ForegroundColor DarkCyan
@@ -222,16 +232,123 @@ function Write-FramedOutput {
     Write-Host $Sym.sBR -ForegroundColor $BorderColor
 }
 
+# --- GitHub Self-Update Check ---
+
+function Test-ScriptGitHubUpdate {
+    param([switch]$ShowOutput)
+
+    if (-not $CheckScriptUpdates) { return }
+
+    $Script:ScriptUpdateAvail = $false
+    $Script:RemoteVersion     = $null
+    $Script:RemoteScriptBody  = $null
+
+    $branches = @("main", "master")
+    $rawContent = $null
+
+    foreach ($branch in $branches) {
+        $url = "https://raw.githubusercontent.com/$GitHubRepo/$branch/CheckFluxer.ps1"
+        try {
+            $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($resp -and -not [string]::IsNullOrWhiteSpace($resp.Content)) {
+                $rawContent = $resp.Content
+                break
+            }
+        } catch {
+            continue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($rawContent)) {
+        if ($ShowOutput) {
+            Invoke-CyberSpinner -Label "Checking GitHub ($GitHubRepo)" -DurationMs 500 -StatusText "UNREACHABLE" -StatusColor Yellow
+        }
+        return
+    }
+
+    if ($rawContent -match '\$ScriptVersion\s*=\s*"([^"]+)"') {
+        $remoteVerStr = $Matches[1]
+        $Script:RemoteVersion = $remoteVerStr
+        try {
+            $isNewer = ([version]$remoteVerStr) -gt ([version]$ScriptVersion)
+        } catch {
+            $isNewer = ($remoteVerStr -ne $ScriptVersion)
+        }
+
+        if ($isNewer) {
+            $Script:ScriptUpdateAvail = $true
+            $Script:RemoteScriptBody  = $rawContent
+            if ($ShowOutput) {
+                Invoke-CyberSpinner -Label "Checking GitHub ($GitHubRepo)" -DurationMs 500 -StatusText ("v" + $remoteVerStr + " AVAIL") -StatusColor Yellow
+                Write-FramedOutput -Title "SCRIPT UPDATE AVAILABLE" -BorderColor Yellow -Content @"
+A newer version of CheckFluxer.ps1 is available on GitHub!
+  Local Version : v$ScriptVersion
+  GitHub Version: v$remoteVerStr
+  Repo          : https://github.com/$GitHubRepo
+Press [9] in the Control Deck to download and apply the update.
+"@
+            }
+        } else {
+            if ($ShowOutput) {
+                Invoke-CyberSpinner -Label "Checking GitHub ($GitHubRepo)" -DurationMs 500 -StatusText ("v" + $ScriptVersion + " LATEST") -StatusColor Green
+            }
+        }
+    } else {
+        if ($ShowOutput) {
+            Invoke-CyberSpinner -Label "Checking GitHub ($GitHubRepo)" -DurationMs 500 -StatusText "NO VERSION TAG" -StatusColor DarkGray
+        }
+    }
+}
+
+function Invoke-SelfUpdate {
+    Test-ScriptGitHubUpdate -ShowOutput
+
+    if (-not $Script:ScriptUpdateAvail -or [string]::IsNullOrWhiteSpace($Script:RemoteScriptBody)) {
+        Write-FramedOutput -Title "SELF-UPDATE STATUS" -BorderColor Green -Content @"
+You are already running the latest version (v$ScriptVersion),
+or no newer release was found on GitHub ($GitHubRepo).
+"@
+        return
+    }
+
+    $confirm = Read-Host "    Download v$($Script:RemoteVersion) and overwrite this script? (y/N)"
+    if ($confirm -notmatch '^[yY]') {
+        Write-Host "    Update cancelled." -ForegroundColor DarkGray
+        return
+    }
+
+    $selfPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($selfPath)) {
+        Write-FramedOutput -Title "SELF-UPDATE ERROR" -BorderColor Red -Content "Cannot determine current script path (`$PSCommandPath is empty)."
+        return
+    }
+
+    $backupPath = "$selfPath.bak"
+    Copy-Item -Path $selfPath -Destination $backupPath -Force
+    Set-Content -Path $selfPath -Value $Script:RemoteScriptBody -Encoding ASCII
+
+    Write-FramedOutput -Title "SCRIPT UPDATED" -BorderColor Green -Content @"
+Updated CheckFluxer.ps1 to v$($Script:RemoteVersion)!
+Previous script backed up to: $backupPath
+Restarting script now...
+"@
+    Start-Sleep -Seconds 2
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $selfPath
+    exit 0
+}
+
 # --- Core Fluxer / rexctl Workflows ---
 
 function Test-Prerequisites {
-    Write-SectionHeader -Phase "PHASE 01" -Title "Environment and Daemon Telemetry"
+    Write-SectionHeader -Phase "PHASE 01" -Title "Environment, GitHub and Daemon Telemetry"
 
-    Invoke-CyberSpinner -Label "Scanning host runtime and network sockets" -DurationMs 700 -StatusText "ONLINE"
-    $hasDocker = [bool](<Get-Command 'docker' -ErrorAction SilentlyContinue>)
+    Invoke-CyberSpinner -Label "Scanning host runtime and network sockets" -DurationMs 650 -StatusText "ONLINE"
+    $hasDocker = [bool](Get-Command 'docker' -ErrorAction SilentlyContinue)
     $dockerText = if ($hasDocker) { "DETECTED" } else { "NOT IN PATH" }
     $dockerColor = if ($hasDocker) { "Green" } else { "Yellow" }
-    Invoke-CyberSpinner -Label "Checking Docker Engine availability" -DurationMs 750 -StatusText $dockerText -StatusColor $dockerColor
+    Invoke-CyberSpinner -Label "Checking Docker Engine availability" -DurationMs 700 -StatusText $dockerText -StatusColor $dockerColor
+
+    Test-ScriptGitHubUpdate -ShowOutput
 
     if (-not (Get-Command 'rexctl' -ErrorAction SilentlyContinue)) {
         Write-Host ("    " + $Sym.Cross + " ") -NoNewline -ForegroundColor Red
@@ -244,10 +361,10 @@ Docs: https://fluxer.app
         return $false
     }
 
-    Invoke-CyberSpinner -Label "Locating Fluxer 'rexctl' binary in PATH" -DurationMs 650 -StatusText "VERIFIED"
+    Invoke-CyberSpinner -Label "Locating Fluxer 'rexctl' binary in PATH" -DurationMs 600 -StatusText "VERIFIED"
 
     if ($RunDoctorOnStart) {
-        Invoke-CyberSpinner -Label "Running 'rexctl doctor' diagnostic scan" -DurationMs 900 -StatusText "RUNNING"
+        Invoke-CyberSpinner -Label "Running 'rexctl doctor' diagnostic scan" -DurationMs 850 -StatusText "RUNNING"
         $docOut = & rexctl @GlobalRexArgs doctor 2>&1 | Out-String
         Write-FramedOutput -Title "REXCTL DOCTOR REPORT" -Content $docOut -BorderColor Magenta
     }
@@ -325,6 +442,11 @@ function Write-MenuOptions {
     Write-Host "    [6] " -NoNewline -ForegroundColor Cyan;    Write-Host "Manage Auto-Upgrade Schedule   " -NoNewline -ForegroundColor White; Write-Host "(rexctl auto-upgrade [on/off])" -ForegroundColor DarkGray
     Write-Host "    [7] " -NoNewline -ForegroundColor Cyan;    Write-Host "Restart Fluxer Containers      " -NoNewline -ForegroundColor White; Write-Host "(rexctl restart)" -ForegroundColor DarkGray
     Write-Host "    [8] " -NoNewline -ForegroundColor Cyan;    Write-Host "View Recent Service Logs       " -NoNewline -ForegroundColor White; Write-Host "(rexctl logs)" -ForegroundColor DarkGray
+    if ($Script:ScriptUpdateAvail) {
+        Write-Host "    [9] " -NoNewline -ForegroundColor Yellow; Write-Host "Update Script from GitHub      " -NoNewline -ForegroundColor Yellow; Write-Host "(v$ScriptVersion -> v$($Script:RemoteVersion) AVAILABLE!)" -ForegroundColor Yellow
+    } else {
+        Write-Host "    [9] " -NoNewline -ForegroundColor Cyan;   Write-Host "Check Script GitHub Updates    " -NoNewline -ForegroundColor White; Write-Host "($GitHubRepo)" -ForegroundColor DarkGray
+    }
     Write-Host "    [Q] " -NoNewline -ForegroundColor Magenta; Write-Host "Exit Auto-Watchdog Utility" -ForegroundColor White
     Write-Host ""
 }
@@ -351,7 +473,7 @@ function Wait-NextCheckOrKey {
         if ([Console]::KeyAvailable) {
             $keyInfo = [Console]::ReadKey($true)
             $char = $keyInfo.KeyChar.ToString().ToUpper()
-            if ($char -match '^[1-8Q]$') {
+            if ($char -match '^[1-9Q]$') {
                 Write-Host ""
                 return $char
             }
@@ -374,7 +496,7 @@ function Wait-NextCheckOrKey {
         Write-Host "AUTO-CHECK IN: " -NoNewline -ForegroundColor Yellow
         Write-Host "$timeFormatted " -NoNewline -ForegroundColor White
         Write-Host "[$barStr] " -NoNewline -ForegroundColor DarkCyan
-        Write-Host "Press [1-8] or [Q] anytime " -NoNewline -ForegroundColor DarkGray
+        Write-Host "Press [1-9] or [Q] anytime " -NoNewline -ForegroundColor DarkGray
 
         Start-Sleep -Milliseconds 200
     }
@@ -456,6 +578,10 @@ function Show-ControlDeck {
             "8" {
                 Write-Host ("`n    " + $Sym.Arrow + " Streaming logs (Press Ctrl+C to stop if streaming)...`n") -ForegroundColor Cyan
                 & rexctl @GlobalRexArgs logs
+                Write-MenuOptions
+            }
+            "9" {
+                Invoke-SelfUpdate
                 Write-MenuOptions
             }
             "Q" {
